@@ -1,0 +1,177 @@
+#include <Bluepad32.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+
+// ---- WiFi credentials ----
+const char* WIFI_SSID = "WIFi_NAME";
+const char* WIFI_PASS = "WIFI_PASSWORD";
+
+// ---- WiZ light ----
+const char* WIZ_IP = "LIGHT_IP";
+const int WIZ_PORT = PORT;
+
+WiFiUDP udp;
+ControllerPtr myController = nullptr;
+
+// Light state
+bool lightOn = false;
+int brightness = 100;
+int r = 255, g = 255, b = 255;
+
+// Button tracking
+bool lastX = false;
+bool lastDpadUp = false;
+bool lastDpadDown = false;
+
+// Timing for smooth joystick/trigger updates
+unsigned long lastColorUpdate = 0;
+const int COLOR_UPDATE_INTERVAL = 100; // ms between updates
+
+// ---- Send UDP command to WiZ ----
+void sendToWiz(String json) {
+    udp.beginPacket(WIZ_IP, WIZ_PORT);
+    udp.print(json);
+    udp.endPacket();
+    Serial.println("Sent: " + json);
+}
+
+void toggleLight() {
+    lightOn = !lightOn;
+    if (lightOn) {
+        String cmd = "{\"id\":1,\"method\":\"setState\",\"params\":{\"state\":true,\"r\":"
+                     + String(r) + ",\"g\":" + String(g) + ",\"b\":" + String(b)
+                     + ",\"dimming\":" + String(brightness) + "}}";
+        sendToWiz(cmd);
+    } else {
+        sendToWiz("{\"id\":1,\"method\":\"setState\",\"params\":{\"state\":false}}");
+    }
+    Serial.printf("Light %s\n", lightOn ? "ON" : "OFF");
+}
+
+void updateColor() {
+    String cmd = "{\"id\":1,\"method\":\"setState\",\"params\":{\"state\":true,\"r\":"
+                 + String(r) + ",\"g\":" + String(g) + ",\"b\":" + String(b)
+                 + ",\"dimming\":" + String(brightness) + "}}";
+    sendToWiz(cmd);
+    lightOn = true;
+    Serial.printf("Color: R=%d G=%d B=%d\n", r, g, b);
+}
+
+void changeBrightness(int amount) {
+    brightness = constrain(brightness + amount, 10, 100);
+    if (lightOn) {
+        String cmd = "{\"id\":1,\"method\":\"setState\",\"params\":{\"state\":true,\"dimming\":"
+                     + String(brightness) + "}}";
+        sendToWiz(cmd);
+    }
+    Serial.printf("Brightness: %d%%\n", brightness);
+}
+
+// Map joystick value (-512 to 512) to a color change amount
+// Negative Y = stick up = increase, Positive Y = stick down = decrease
+int joystickToChange(int value, int deadzone) {
+    if (abs(value) < deadzone) return 0;
+    return map(value, -512, 512, 5, -5);
+}
+
+// Map trigger value (0 to 1023)
+// L2 = decrease blue, R2 = increase blue
+int triggerToChange(int value, int threshold) {
+    if (value < threshold) return 0;
+    return map(value, threshold, 1023, 1, 5);
+}
+
+// ---- BluePad32 callbacks ----
+void onConnectedController(ControllerPtr ctl) {
+    Serial.println("Controller connected!");
+    myController = ctl;
+}
+
+void onDisconnectedController(ControllerPtr ctl) {
+    Serial.println("Controller disconnected");
+    myController = nullptr;
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    Serial.printf("Connecting to %s", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected! IP: " + WiFi.localIP().toString());
+
+    udp.begin(38900);
+
+    BP32.setup(&onConnectedController, &onDisconnectedController);
+    BP32.forgetBluetoothKeys();
+
+    Serial.println("Ready - pair DualSense (hold Share + PS)");
+}
+
+void loop() {
+    BP32.update();
+
+    if (myController && myController->isConnected()) {
+
+        // X button -> toggle on/off
+        bool x = myController->a();
+        if (x && !lastX) toggleLight();
+        lastX = x;
+
+        // D-pad Up/Down -> brightness
+        bool dUp = (myController->dpad() & 0x01);
+        if (dUp && !lastDpadUp) changeBrightness(10);
+        lastDpadUp = dUp;
+
+        bool dDown = (myController->dpad() & 0x02);
+        if (dDown && !lastDpadDown) changeBrightness(-10);
+        lastDpadDown = dDown;
+
+        // Joysticks and triggers for RGB (updated on interval)
+        if (millis() - lastColorUpdate > COLOR_UPDATE_INTERVAL) {
+            bool colorChanged = false;
+
+            // Left stick Y -> Red (up = increase, down = decrease)
+            int leftY = myController->axisY();
+            int redChange = joystickToChange(leftY, 50);
+            if (redChange != 0) {
+                r = constrain(r + redChange, 0, 255);
+                colorChanged = true;
+            }
+
+            // Right stick Y -> Green (up = increase, down = decrease)
+            int rightY = myController->axisRY();
+            int greenChange = joystickToChange(rightY, 50);
+            if (greenChange != 0) {
+                g = constrain(g + greenChange, 0, 255);
+                colorChanged = true;
+            }
+
+            // L2 -> decrease blue
+            int l2 = myController->brake();
+            int l2Change = triggerToChange(l2, 100);
+            if (l2Change > 0) {
+                b = constrain(b - l2Change, 0, 255);
+                colorChanged = true;
+            }
+
+            // R2 -> increase blue
+            int r2 = myController->throttle();
+            int r2Change = triggerToChange(r2, 100);
+            if (r2Change > 0) {
+                b = constrain(b + r2Change, 0, 255);
+                colorChanged = true;
+            }
+
+            if (colorChanged) {
+                updateColor();
+                lastColorUpdate = millis();
+            }
+        }
+    }
+
+    delay(20);
+}
